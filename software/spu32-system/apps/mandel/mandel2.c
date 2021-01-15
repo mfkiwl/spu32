@@ -3,11 +3,47 @@
 
 // fixed point precision, bits for fractional part
 const uint32_t SHIFT = 24;
-const uint32_t PIXELS_X = 80;
-const uint32_t PIXELS_Y = 28;
+const uint32_t PIXELS_X = 320;
+const uint32_t PIXELS_Y = 240;
+
+void setVideoMode(uint8_t* framebuf)
+{
+
+    // clear framebuffer
+    for(int i = 0; i < (PIXELS_X * PIXELS_Y); ++i) {
+        framebuf[i] = 0;
+    }
+
+    uint8_t palette[256 * 3];
+    for(int i = 0; i < 256; i++) {
+        uint8_t r, g, b;
+        if(i == 0) {
+            r = g = b = 0;
+        } else {
+            r = (i + 64) & 0xFF;
+            g = (i + 128) & 0xFF;
+            b = (i + 192) & 0xFF;
+        }
+
+        palette[i * 3] = r;
+        palette[i * 3 + 1] = g;
+        palette[i * 3 + 2] = b;
+    }
+    bios_video_set_palette(palette);
+
+    videomode_t mode;
+    void* videobase;
+    void* fontbase;
+
+    bios_video_get_mode(&mode, &videobase, &fontbase);
+    mode = VIDEOMODE_GRAPHICS_320;
+    videobase = framebuf;
+
+    bios_video_set_mode(mode, videobase, fontbase);
+}
 
 // originally based on https://rosettacode.org/wiki/Mandelbrot_set#B
-void renderMandel(int32_t xmin, int32_t dx, int32_t ymin, int32_t dy, uint32_t maxiter)
+void renderMandel(int32_t xmin, int32_t dx, int32_t ymin, int32_t dy, uint32_t maxiter, uint8_t* framebuf)
 {
 
     int32_t cy = ymin;
@@ -42,7 +78,7 @@ void renderMandel(int32_t xmin, int32_t dx, int32_t ymin, int32_t dy, uint32_t m
                 iter++;
             }
 
-            printf("%c", " .:-;!/>)|&IH%*#"[iter & 0x0F]);
+            *framebuf++ = (uint8_t)(iter & 0xFF);
             cx += dx;
         }
         //printf("\n\r");
@@ -66,7 +102,15 @@ int main()
 
     const int32_t maxiter = 256;
 
-    renderMandel(xmin, dx, ymin, dy, maxiter);
+    // create and clear framebuffer
+    uint8_t framebuf[PIXELS_X * PIXELS_Y];
+ 
+    setVideoMode(framebuf);
+    renderMandel(xmin, dx, ymin, dy, maxiter, framebuf);
+
+    // wait for input, then exit
+    char buf[2];
+    read_string(buf, sizeof(buf), 1);
 
     return (0);
 }
