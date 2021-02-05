@@ -1,6 +1,7 @@
 `default_nettype none
 
 `include "./cpu/alu.v"
+`include "./cpu/branch.v"
 `include "./cpu/bus.v"
 `include "./cpu/decoder.v"
 `include "./cpu/registers.v"
@@ -32,7 +33,7 @@ module spu32_cpu
     // MSRS
     reg[31:2] pc, pcnext, epc;
     reg[31:2] evect = VECTOR_EXCEPTION[31:2];
-    reg nextpc_from_alu, writeback_from_alu, writeback_from_bus;
+    reg nextpc_from_alu, nextpc_from_bru, writeback_from_alu, writeback_from_bus;
      // current and previous machine-mode external interrupt enable
     reg meie = 0, meie_prev = 0;
      // machine cause register, mcause[4] denotes interrupt, mcause[3:0] encodes exception code
@@ -45,7 +46,6 @@ module spu32_cpu
 
     // ALU instance
     reg alu_en = 0;
-    reg[3:0] alu_op = 0;
     wire[31:0] alu_dataout;
     reg[31:0] alu_dataS1, alu_dataS2;
     wire alu_busy, alu_lt, alu_ltu, alu_eq;
@@ -56,14 +56,14 @@ module spu32_cpu
         .I_reset(reset),
         .I_dataS1(alu_dataS1),
         .I_dataS2(alu_dataS2),
-        .I_aluop(alu_op),
+        .I_aluop(dec_aluop),
         .O_busy(alu_busy),
         .O_data(alu_dataout),
         .O_lt(alu_lt),
         .O_ltu(alu_ltu),
         .O_eq(alu_eq)
     );
-    
+
     reg bus_en = 0;
     reg[2:0] bus_op = 0;
     wire[31:0] bus_dataout;
@@ -112,6 +112,7 @@ module spu32_cpu
     wire[5:0] dec_branchmask;
     wire[3:0] dec_aluop;
     wire[2:0] dec_busop;
+    wire dec_alumux1, dec_alumux2;
     reg dec_en;
 
     spu32_cpu_decoder dec_inst(
@@ -126,7 +127,9 @@ module spu32_cpu
         .O_funct3(dec_funct3),
         .O_branchmask(dec_branchmask),
         .O_aluop(dec_aluop),
-        .O_busop(dec_busop)
+        .O_busop(dec_busop),
+        .O_alumux1(dec_alumux1),
+        .O_alumux2(dec_alumux2)
     );
 
     // Registers instance
@@ -142,12 +145,31 @@ module spu32_cpu
         .O_regval2(reg_val2)
     );
 
+    reg bru_en = 0;
+    reg bru_eval_branch = 0;
+    wire[31:0] bru_nextpc;
+    wire bru_misaligned;
+
+    // Branch unit instance
+    spu32_cpu_branch bru_inst(
+        .I_clk(clk),
+        .I_en(bru_en),
+        .I_evaluate_branch(bru_eval_branch),
+        .I_branchmask(dec_branchmask),
+        .I_lt(alu_lt),
+        .I_ltu(alu_ltu),
+        .I_eq(alu_eq),
+        .I_pc({pc, 2'b00}),
+        .I_imm(dec_imm),
+        .O_nextpc(bru_nextpc),
+        .O_misaligned(bru_misaligned)
+    );
+
     // Muxer for first operand of ALU
     localparam MUX_ALUDAT1_REGVAL1 = 0;
     localparam MUX_ALUDAT1_PC      = 1;
-    reg mux_alu_s1_sel = MUX_ALUDAT1_REGVAL1;
     always @(*) begin
-        case(mux_alu_s1_sel)
+        case(dec_alumux1)
             MUX_ALUDAT1_REGVAL1: alu_dataS1 = reg_val1;
             default:             alu_dataS1 = {pc, 2'b00}; // MUX_ALUDAT1_PC
         endcase
@@ -156,13 +178,10 @@ module spu32_cpu
     // Muxer for second operand of ALU
     localparam MUX_ALUDAT2_REGVAL2 = 0;
     localparam MUX_ALUDAT2_IMM     = 1;
-    localparam MUX_ALUDAT2_INSTLEN = 2;
-    reg[1:0] mux_alu_s2_sel = MUX_ALUDAT2_REGVAL2;
     always @(*) begin
-        case(mux_alu_s2_sel)
+        case(dec_alumux2)
             MUX_ALUDAT2_REGVAL2: alu_dataS2 = reg_val2;
-            MUX_ALUDAT2_IMM:     alu_dataS2 = dec_imm;
-            default:             alu_dataS2 = 4; // MUX_ALUDAT2_INSTLEN
+            default:             alu_dataS2 = dec_imm; // MUX_ALUDAT_IMM
         endcase
     end
 
@@ -204,14 +223,14 @@ module spu32_cpu
     // Muxer for register data input
     localparam MUX_REGINPUT_ALU = 0;
     localparam MUX_REGINPUT_BUS = 1;
-    localparam MUX_REGINPUT_IMM = 2;
+    localparam MUX_REGINPUT_BRU = 2;
     localparam MUX_REGINPUT_MSR = 3;
     reg[1:0] mux_reg_input_sel = MUX_REGINPUT_ALU;
     always @(*) begin
         case(mux_reg_input_sel)
             MUX_REGINPUT_ALU: reg_datain = alu_dataout;
             MUX_REGINPUT_BUS: reg_datain = bus_dataout;
-            MUX_REGINPUT_IMM: reg_datain = dec_imm;
+            MUX_REGINPUT_BRU: reg_datain = bru_nextpc;
             default:          reg_datain = msr_data; // MUX_REGINPUT_MSR
         endcase
     end
@@ -233,11 +252,6 @@ module spu32_cpu
     wire busy;
     assign busy = alu_busy | bus_busy;
 
-    // evaluate branch conditions
-    wire branch;
-    assign branch = (dec_branchmask & {!alu_ltu, alu_ltu, !alu_lt, alu_lt, !alu_eq, alu_eq}) != 0;
-
-
     // only transition to new state if not busy    
     always @(*) begin
         state = busy ? prevstate : nextstate;
@@ -246,16 +260,14 @@ module spu32_cpu
     always @(negedge clk) begin
 
         alu_en <= 0;
+        bru_en <= 0;
+        bru_eval_branch <= 0;
         bus_en <= 0;
         dec_en <= 0;
         reg_re <= 0;
         reg_we <= 0;
 
-        mux_alu_s1_sel <= MUX_ALUDAT1_REGVAL1;
-        mux_alu_s2_sel <= MUX_ALUDAT2_REGVAL2;
         mux_reg_input_sel <= MUX_REGINPUT_ALU;
-
-        alu_op <= `ALUOP_ADD;
 
         // remember currently active state to return to if busy
         prevstate <= state;
@@ -267,6 +279,7 @@ module spu32_cpu
                 meie <= 0; // disable machine-mode external interrupt
                 nextstate <= STATE_FETCH;
                 nextpc_from_alu <= 0;
+                nextpc_from_bru <= 0;
                 writeback_from_alu <= 0;
                 writeback_from_bus <= 0;
             end
@@ -282,6 +295,9 @@ module spu32_cpu
                 // TODO: if alu_dataout contains a misaligned address, raise exception
                 // instead of altering the PC.
                 pc <= nextpc_from_alu ? alu_dataout[31:2] : pcnext[31:2];
+                if(nextpc_from_bru) begin
+                    pc <= bru_nextpc[31:2];
+                end
 
                 // fetch next instruction 
                 bus_en <= 1;
@@ -293,6 +309,7 @@ module spu32_cpu
             STATE_DECODE: begin
                 // assume for now the next PC will come from pcnext
                 nextpc_from_alu <= 0;
+                nextpc_from_bru <= 0;
 
                 dec_en <= 1;
                 nextstate <= STATE_EXEC;
@@ -300,10 +317,8 @@ module spu32_cpu
                 // read registers
                 reg_re <= 1;
 
-                // ALU is unused... let's compute PC+4!
-                alu_en <= 1;
-                mux_alu_s1_sel <= MUX_ALUDAT1_PC;
-                mux_alu_s2_sel <= MUX_ALUDAT2_INSTLEN;
+                // compute PC+4 on branch unit
+                bru_en <= 1;
 
                 // checking for interrupt here because no bus operations are active here
                 // TODO: find a proper place that doesn't let an instruction fetch go to waste
@@ -315,65 +330,33 @@ module spu32_cpu
             end
 
             STATE_EXEC: begin
-                // ALU output when coming from decode is PC+4... store it in pcnext
-                if(!busy) pcnext <= alu_dataout[31:2];
+                // PC+4 was computed on branch unit, save
+                pcnext <= bru_nextpc[31:2];
+
+                alu_en <= 1;
 
                 case(dec_opcode)
-                    `OP_OP, `OP_OPIMM: begin
-                        alu_en <= 1;
-                        mux_alu_s1_sel <= MUX_ALUDAT1_REGVAL1;
-                        mux_alu_s2_sel <= (dec_opcode[3]) ? MUX_ALUDAT2_REGVAL2 : MUX_ALUDAT2_IMM;
-                        alu_op <= dec_aluop;
+                    `OP_OP, `OP_OPIMM, `OP_LUI, `OP_AUIPC: begin
                         // do register writeback in FETCH
                         writeback_from_alu <= 1;
                         nextstate <= STATE_FETCH;
                     end
 
                     `OP_LOAD, `OP_STORE: begin // compute load/store address on ALU
-                        alu_en <= 1;
-                        alu_op <= `ALUOP_ADD;
-                        mux_alu_s1_sel <= MUX_ALUDAT1_REGVAL1;
-                        mux_alu_s2_sel <= MUX_ALUDAT2_IMM;
                         nextstate <= STATE_LOADSTORE;
                     end
 
                     `OP_JAL, `OP_JALR: begin
-                        // return address computed during decode, write to register
+                        // return address computed in branch unit during decode, write to register
                         reg_we <= 1;
-                        mux_reg_input_sel <= MUX_REGINPUT_ALU;
-
-                        // compute jal/jalr address
-                        alu_en <= 1;
-                        alu_op <= `ALUOP_ADD;
-                        mux_alu_s1_sel <= (dec_opcode[1]) ? MUX_ALUDAT1_PC : MUX_ALUDAT1_REGVAL1;
-                        mux_alu_s2_sel <= MUX_ALUDAT2_IMM;
+                        mux_reg_input_sel <= MUX_REGINPUT_BRU;
 
                         nextpc_from_alu <= 1;
                         nextstate <= STATE_FETCH;
                     end
 
                     `OP_BRANCH: begin // use ALU for comparisons
-                        alu_en <= 1;
-                        alu_op <= `ALUOP_ADD; // doesn't really matter
-                        mux_alu_s1_sel <= MUX_ALUDAT1_REGVAL1;
-                        mux_alu_s2_sel <= MUX_ALUDAT2_REGVAL2;
                         nextstate <= STATE_BRANCH2;
-                    end
-
-                    `OP_AUIPC: begin // compute PC + IMM on ALU
-                        alu_en <= 1;
-                        alu_op <= `ALUOP_ADD;
-                        mux_alu_s1_sel <= MUX_ALUDAT1_PC;
-                        mux_alu_s2_sel <= MUX_ALUDAT2_IMM;
-                        // do register writeback in FETCH
-                        writeback_from_alu <= 1;
-                        nextstate <= STATE_FETCH;
-                    end
-
-                    `OP_LUI: begin
-                        reg_we <= 1;
-                        mux_reg_input_sel <= MUX_REGINPUT_IMM;
-                        nextstate <= STATE_FETCH;
                     end
 
                     `OP_MISCMEM:    nextstate <= STATE_FETCH; // nop
@@ -394,13 +377,10 @@ module spu32_cpu
 
 
             STATE_BRANCH2: begin
-                // use idle ALU to compute PC+immediate - in case we branch
-                alu_en <= 1;
-                alu_op <= `ALUOP_ADD;
-                mux_alu_s1_sel <= MUX_ALUDAT1_PC;
-                mux_alu_s2_sel <= MUX_ALUDAT2_IMM;
-
-                nextpc_from_alu <= branch;
+                // use branch unit to evaluate branch and compute branch target
+                bru_en <= 1;
+                bru_eval_branch <= 1;
+                nextpc_from_bru <= 1;
                 nextstate <= STATE_FETCH;
             end
 

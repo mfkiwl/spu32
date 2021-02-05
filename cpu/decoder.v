@@ -15,8 +15,18 @@ module spu32_cpu_decoder(
         output[2:0] O_funct3,
         output reg[5:0] O_branchmask,
         output reg[3:0] O_aluop,
-        output reg[2:0] O_busop
+        output reg[2:0] O_busop,
+        output reg O_alumux1,
+        output reg O_alumux2
     );
+
+    // Muxer for first operand of ALU
+    localparam MUX_ALUDAT1_REGVAL1 = 0;
+    localparam MUX_ALUDAT1_PC      = 1;
+
+    // Muxer for second operand of ALU
+    localparam MUX_ALUDAT2_REGVAL2 = 0;
+    localparam MUX_ALUDAT2_IMM     = 1;
 
     reg[31:0] instr;
 
@@ -31,8 +41,11 @@ module spu32_cpu_decoder(
     assign O_funct3 = funct3;
     assign O_opcode = opcode;
 
+    // LUI is handled as reg+imm addition, with rs1 being hardwired to zero
+    wire is_lui_op = I_instr[6:2] == `OP_LUI;
+
     // combinatorial decode of source register information to allow for register read during decode
-    assign O_rs1 = I_instr[19:15];
+    assign O_rs1 =  is_lui_op ? 5'b00000 : I_instr[19:15];
     assign O_rs2 = I_instr[24:20];
 
     reg isbranch = 0;
@@ -50,8 +63,19 @@ module spu32_cpu_decoder(
             `OP_JAL: imm = {{11{instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:25], instr[24:21], 1'b0}; // UJ-type
             default: imm = {{20{instr[31]}}, instr[31:20]}; // I-type and R-type. Immediate has no meaning for R-type instructions
         endcase
-
         O_imm = imm;
+
+        // determine first ALU data input
+        case(opcode)
+            `OP_JAL, `OP_AUIPC: O_alumux1 = MUX_ALUDAT1_PC;
+            default:            O_alumux1 = MUX_ALUDAT1_REGVAL1;
+        endcase
+
+        // determien second ALU data input
+        case(opcode)
+            `OP_OP, `OP_BRANCH: O_alumux2 = MUX_ALUDAT2_REGVAL2;
+            default:            O_alumux2 = MUX_ALUDAT2_IMM;
+        endcase
 
         isbranch = (opcode == `OP_BRANCH);
         O_branchmask = 0;
@@ -94,7 +118,12 @@ module spu32_cpu_decoder(
             default:            aluop_opimm = `ALUOP_ADD;
         endcase
 
-        O_aluop = (opcode == `OP_OPIMM ? aluop_opimm : aluop_op);
+        // select op for alu
+        case(opcode)
+            `OP_OP   : O_aluop = aluop_op;
+            `OP_OPIMM: O_aluop = aluop_opimm;
+            default  : O_aluop = `ALUOP_ADD;
+        endcase
 
         // OP_LOAD
         case(funct3)
