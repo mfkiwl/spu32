@@ -31,9 +31,9 @@ module spu32_cpu
     assign reset = I_reset;
 
     // MSRS
-    reg[31:2] pc, pcnext, epc;
+    reg[31:2] pc, pc_alu, pcnext, epc;
     reg[31:2] evect = VECTOR_EXCEPTION[31:2];
-    reg nextpc_from_alu, nextpc_from_bru, writeback_from_alu, writeback_from_bus;
+    reg nextpc_from_alu, nextpc_from_bru, writeback_in_fetch;
      // current and previous machine-mode external interrupt enable
     reg meie = 0, meie_prev = 0;
      // machine cause register, mcause[4] denotes interrupt, mcause[3:0] encodes exception code
@@ -112,7 +112,8 @@ module spu32_cpu
     wire[5:0] dec_branchmask;
     wire[3:0] dec_aluop;
     wire[2:0] dec_busop;
-    wire dec_alumux1, dec_alumux2;
+    wire dec_alumux1, dec_alumux2, dec_writeback;
+    wire[1:0] dec_reginputmux;
     reg dec_en;
 
     spu32_cpu_decoder dec_inst(
@@ -124,12 +125,14 @@ module spu32_cpu
         .O_rd(dec_rd),
         .O_imm(dec_imm),
         .O_opcode(dec_opcode),
+        .O_writeback(dec_writeback),
         .O_funct3(dec_funct3),
         .O_branchmask(dec_branchmask),
         .O_aluop(dec_aluop),
         .O_busop(dec_busop),
         .O_alumux1(dec_alumux1),
-        .O_alumux2(dec_alumux2)
+        .O_alumux2(dec_alumux2),
+        .O_reginputmux(dec_reginputmux)
     );
 
     // Registers instance
@@ -171,7 +174,7 @@ module spu32_cpu
     always @(*) begin
         case(dec_alumux1)
             MUX_ALUDAT1_REGVAL1: alu_dataS1 = reg_val1;
-            default:             alu_dataS1 = {pc, 2'b00}; // MUX_ALUDAT1_PC
+            default:             alu_dataS1 = {pc_alu, 2'b00}; // MUX_ALUDAT1_PC
         endcase
     end
 
@@ -225,9 +228,8 @@ module spu32_cpu
     localparam MUX_REGINPUT_BUS = 1;
     localparam MUX_REGINPUT_BRU = 2;
     localparam MUX_REGINPUT_MSR = 3;
-    reg[1:0] mux_reg_input_sel = MUX_REGINPUT_ALU;
     always @(*) begin
-        case(mux_reg_input_sel)
+        case(dec_reginputmux)
             MUX_REGINPUT_ALU: reg_datain = alu_dataout;
             MUX_REGINPUT_BUS: reg_datain = bus_dataout;
             MUX_REGINPUT_BRU: reg_datain = bru_nextpc;
@@ -243,9 +245,7 @@ module spu32_cpu
     localparam STATE_BRANCH2        = 5;
     localparam STATE_TRAP1          = 6;
     localparam STATE_SYSTEM         = 7;
-    localparam STATE_CSRRW1         = 8;
-    localparam STATE_CSRRW2         = 9;
-
+    localparam STATE_CSRRW          = 8;
 
     reg[3:0] state, prevstate = STATE_RESET, nextstate = STATE_RESET;
 
@@ -255,6 +255,11 @@ module spu32_cpu
     // only transition to new state if not busy    
     always @(*) begin
         state = busy ? prevstate : nextstate;
+    end
+
+    always @(posedge clk) begin
+        // posedge-registered copy of PC to avoid negedge -> posedge critical path in ALU
+        pc_alu <= pc;
     end
 
     always @(negedge clk) begin
@@ -267,8 +272,6 @@ module spu32_cpu
         reg_re <= 0;
         reg_we <= 0;
 
-        mux_reg_input_sel <= MUX_REGINPUT_ALU;
-
         // remember currently active state to return to if busy
         prevstate <= state;
 
@@ -280,16 +283,13 @@ module spu32_cpu
                 nextstate <= STATE_FETCH;
                 nextpc_from_alu <= 0;
                 nextpc_from_bru <= 0;
-                writeback_from_alu <= 0;
-                writeback_from_bus <= 0;
+                writeback_in_fetch <= 0;
             end
 
             STATE_FETCH: begin
                 // write result of previous instruction to registers if requested
-                mux_reg_input_sel <= writeback_from_alu ? MUX_REGINPUT_ALU : MUX_REGINPUT_BUS;
-                reg_we <= writeback_from_alu | writeback_from_bus;
-                writeback_from_alu <= 0;
-                writeback_from_bus <= 0;
+                reg_we <= writeback_in_fetch;
+                writeback_in_fetch <= 0;
 
                 // update PC
                 // TODO: if alu_dataout contains a misaligned address, raise exception
@@ -334,11 +334,10 @@ module spu32_cpu
                 pcnext <= bru_nextpc[31:2];
 
                 alu_en <= 1;
+                writeback_in_fetch <= dec_writeback;
 
                 case(dec_opcode)
                     `OP_OP, `OP_OPIMM, `OP_LUI, `OP_AUIPC: begin
-                        // do register writeback in FETCH
-                        writeback_from_alu <= 1;
                         nextstate <= STATE_FETCH;
                     end
 
@@ -347,10 +346,8 @@ module spu32_cpu
                     end
 
                     `OP_JAL, `OP_JALR: begin
-                        // return address computed in branch unit during decode, write to register
-                        reg_we <= 1;
-                        mux_reg_input_sel <= MUX_REGINPUT_BRU;
-
+                        // return address computed in branch unit during DECODE and
+                        // will be written to register in FETCH
                         nextpc_from_alu <= 1;
                         nextstate <= STATE_FETCH;
                     end
@@ -370,8 +367,6 @@ module spu32_cpu
                 bus_en <= 1;
                 mux_bus_addr_sel <= MUX_BUSADDR_ALU;
                 bus_op <= dec_busop;
-                //writeback_from_bus <= !dec_opcode[3];
-                writeback_from_bus <= (dec_opcode == `OP_LOAD);
                 nextstate <= STATE_FETCH;
             end
 
@@ -404,7 +399,9 @@ module spu32_cpu
 
                     `FUNC_CSRRW: begin
                         // handle csrrw here
-                        nextstate <= STATE_CSRRW1;
+                        // write current MSR-value to register, before modification
+                        reg_we <= 1;
+                        nextstate <= STATE_CSRRW;
                     end
 
                     // unsupported SYSTEM instruction
@@ -421,14 +418,7 @@ module spu32_cpu
                 nextstate <= STATE_FETCH;
             end
 
-            STATE_CSRRW1: begin
-                // write MSR-value to register
-                mux_reg_input_sel <= MUX_REGINPUT_MSR;
-                reg_we <= 1;
-                nextstate <= STATE_CSRRW2;
-            end
-
-            STATE_CSRRW2: begin
+            STATE_CSRRW: begin
                 // update MSRs with value of rs1
                 if(!dec_imm[11]) begin // denotes a writable non-standard machine-mode MSR
                     case(dec_imm[1:0])

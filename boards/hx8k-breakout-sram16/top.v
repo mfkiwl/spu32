@@ -47,7 +47,7 @@ module top(
 
     );
 
-    wire clk_multiplied, clk, clk_90deg, pll_locked;
+    wire clk_multiplied, clk, clk_shifted, pll_locked;
     // multiply incoming 12 MHz clock to 100.5 MHz
     SB_PLL40_CORE #(							
         .FEEDBACK_PATH("SIMPLE"),				
@@ -72,7 +72,7 @@ module top(
         .DELAY_ADJUSTMENT_MODE_FEEDBACK("FIXED"),
         .FDA_FEEDBACK(4'b0000),
         .DELAY_ADJUSTMENT_MODE_RELATIVE("FIXED"),
-        .FDA_RELATIVE(4'b0000),
+        .FDA_RELATIVE(4'b1111), // delay port A by 16 * 150ps
         .SHIFTREG_DIV_MODE(2'b00),
         .PLLOUT_SELECT_PORTA("SHIFTREG_0deg"),
         .PLLOUT_SELECT_PORTB("SHIFTREG_90deg"),
@@ -84,7 +84,7 @@ module top(
         .BYPASS(1'b0),						
         .REFERENCECLK(clk_multiplied),				
         .PLLOUTGLOBALA(clk),
-        .PLLOUTGLOBALB(clk_90deg)
+        .PLLOUTGLOBALB(clk_shifted) // delayed by about 8.5 ns respective to clk
     );
 
 
@@ -400,7 +400,7 @@ module top(
     sram256kx16_membus_vga_ice40 sram_inst(
         // wiring to "fast-path" membus
         .I_clk(clk),
-        .I_clk_90deg(clk_90deg),
+        .I_clk_shifted(clk_shifted),
         .I_request(membus_sram_request),
         .I_we(membus_sram_we),
         .I_ub(membus_sram_ub),
